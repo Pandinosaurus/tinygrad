@@ -1,394 +1,550 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
-import inspect
-import functools
-import os
-from collections import defaultdict
-import numpy as np
+from __future__ import annotations
+import time, functools, sys, inspect, pathlib, hashlib, weakref
+from typing import Callable, cast, get_args, ParamSpec, TypeVar, TYPE_CHECKING
+if TYPE_CHECKING: import numpy
+from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, least_upper_dtype, to_dtype, _from_np_dtype, _to_np_dtype, PyConst
+from tinygrad.helpers import all_int, getenv, fetch, PROFILE, TracingKey, is_numpy_ndarray, prod
+from tinygrad.helpers import cpu_profile, suppress_finalizing, disable_gc, VIZ
+from tinygrad.uop.ops import UOp, Ops, sint, Variable, ConstLike, PatternMatcher, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
+from tinygrad.mixin.rand import RandMixin
+from tinygrad.schedule import create_linear_with_vars, contiguous_mops_to_view, is_store_after
+from tinygrad.device import Buffer, canonicalize_device, is_disk_device
+from tinygrad.engine.realize import run_linear
 
-# **** profiler ****
+# *** all in scope Tensors are here. this gets relevant UOps ***
 
-DEBUG = os.getenv("DEBUG", None) is not None
-if DEBUG:
-  import atexit, time
-  debug_counts, debug_times = defaultdict(int), defaultdict(float)
-  def print_debug_exit():
-    for name, _ in sorted(debug_times.items(), key=lambda x: -x[1]):
-      print(f"{name:>20} : {debug_counts[name]:>6} {debug_times[name]:>10.2f} ms")
-  atexit.register(print_debug_exit)
+all_tensors: dict[weakref.ref[Tensor], None] = {}
+def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str) -> None:
+  with cpu_profile(TracingKey(name), "TINY"):
+    # get tensors in scope
+    in_scope: dict[UOp, bool] = {}
+    def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
+    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
 
-class ProfileOp:
-  def __init__(self, name, x, backward=False):
-    self.name, self.x, self.output = f"back_{name}" if backward else name, x, None
-  def __enter__(self):
-    if DEBUG: self.st = time.time()
+    # get all Tensors and apply the map. always walk: replace exactly the nodes the map names, values are final
+    sink = UOp.sink(*[t.uop for t in scope_tensors])
+    new_sink = sink.substitute(applied_map, name=f"substitute {name}", walk=True)
+
+    # set the relevant uop to the realized UOps
+    for t,ns in zip(scope_tensors, new_sink.src):
+      t.uop = ns
+
+def _tensor_holds(u:UOp) -> bool: return any((t:=tref()) is not None and t.uop is u for tref in list(all_tensors))
+
+# **** Tensor helper functions ****
+
+def _fromnp(x: 'numpy.ndarray') -> UOp:
+  x = x.astype(x.dtype.newbyteorder("="), copy=False)
+  ret = UOp.new_buffer("NPY", x.size, _from_np_dtype(x.dtype))
+  # fake realize
+  ret.buffer.allocate(x)
+  return ret.reshape(x.shape)
+
+class Tensor(RandMixin):
+  """
+  A `Tensor` is a multi-dimensional matrix containing elements of a single data type.
+
+  ```python exec="true" session="tensor"
+  from tinygrad import Tensor, dtypes, nn, Context
+  import numpy as np
+  import math
+  np.set_printoptions(precision=4)
+  ```
+  """
+  __slots__ = "uop", "is_param", "grad"
+
+  def __init__(self, data:ConstType|bytes|list|tuple|UOp|'numpy.ndarray'|pathlib.Path|None,
+               device:str|tuple|list|None=None, dtype:DTypeLike|None=None):
+    if device is None:
+      if isinstance(data, pathlib.Path): device = f"DISK:{data.resolve()}"  # keep it on the disk if device is None
+      elif isinstance(data, UOp): device = data.device
+    _dtype:DType|None = to_dtype(dtype) if dtype is not None else None
+    _device:str|tuple[str, ...] = canonicalize_device(device)
+    del device, dtype
+
+    # tensors can have gradients if you have called .backward
+    self.grad:Tensor|None = None
+
+    self.is_param:bool = True
+
+    # create a UOp from the different types of inputs
+    if data is None:
+      data = UOp.const(0.0, _dtype)
+    elif isinstance(data, get_args(ConstType)):
+      data = UOp.const(data, _dtype)
+    elif is_numpy_ndarray(data) and data.shape == ():
+      data = UOp.const(data.item(), _dtype or _from_np_dtype(data.dtype))
+    elif not isinstance(data, UOp):
+      if _dtype in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {_dtype}")
+      if isinstance(data, bytes):
+        data = UOp._frompy(data, _dtype or dtypes.uint8)
+      elif isinstance(data, (list, tuple)):
+        data = UOp._frompy(data, _dtype or dtypes.from_py(data))
+      elif is_numpy_ndarray(data):
+        data = _fromnp(data.astype(npdtype) if _dtype is not None and (npdtype:=_to_np_dtype(_dtype)) is not None else data)
+      elif isinstance(data, pathlib.Path):
+        _dtype = _dtype or dtypes.uint8
+        data = UOp.new_buffer(f"DISK:{data.resolve()}", data.stat().st_size // _dtype.itemsize, _dtype)
+
+    # by this point, it has to be a UOp
+    if not isinstance(data, UOp): raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
+
+    # data might be on a different device
+    self.uop:UOp = data if data.device is None or data.device == _device else data.copy_to_device(_device)
+    # cast on the target device, the source may not hold the dtype (numpy has no fp8/bfloat16) or be able to compute it (DISK)
+    if _dtype is not None: self.uop = self.uop.cast(_dtype)
+
+    # add to all_tensors after construction succeeds
+    all_tensors[weakref.ref(self)] = None
+
+  @suppress_finalizing
+  def __del__(self): all_tensors.pop(weakref.ref(self), None)
+
+  def _apply_uop(self, fxn:Callable[..., UOp], *x:Tensor, **kwargs) -> Tensor:
+    srcs = (self,)+x
+    new_uop: UOp = fxn(*[t.uop for t in srcs], **kwargs)
+    # directly create the Tensor
+    ret = Tensor.__new__(Tensor)
+    ret.uop, ret.grad, ret.is_param = new_uop, None, True
+    # add to all_tensors after construction succeeds
+    all_tensors[weakref.ref(ret)] = None
+    return ret
+
+  # alu, _uop, _wrap_uop and const are used by the mixins
+  def alu(self, op: Ops, *src: Tensor) -> Tensor: return self._apply_uop(lambda *u: u[0].alu(op, *u[1:]), *src)
+  @property
+  def _uop(self) -> UOp: return self.uop
+  @classmethod
+  def _wrap_uop(cls, u:UOp) -> Tensor: return cls(u)
+  @staticmethod
+  def const(b:ConstLike, dtype:DType|None=None) -> Tensor: return Tensor(UOp.const(b, dtype))
+
+  def is_param_(self, is_param:bool=True) -> Tensor:
+    self.is_param = is_param
     return self
-  def __exit__(self, *junk):
-    if DEBUG:
-      # TODO: fix this
-      #if cl_queue is not None:
-      #  cl_queue.finish()
-      et = (time.time()-self.st)*1000.
-      debug_counts[self.name] += 1
-      debug_times[self.name] += et
-      print(f"{self.name:>20} : {et:>7.2f} ms {str([y.shape for y in self.x]):>40} {'-> '+str(self.output.shape) if self.output is not None else ''}")
-
-# **** enumerate supported devices ****
-
-class Device:
-  _ops = sorted(os.listdir(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ops")))
-  imports = dict(enumerate([os.path.splitext(x)[0] for x in _ops if x.startswith("ops_")]))
-  DEFAULT = None
-  buffers = {}
-  for i,op in imports.items():
-    name = op[len("ops_"):].upper()
-    vars()[name] = i
-    DEFAULT = i if os.environ.get(name, 0) == "1" else DEFAULT
-  DEFAULT = CPU if DEFAULT is None else DEFAULT
-
-# **** start with two base classes, Tensor and Function ****
-
-class Tensor:
-  did_float_warning = False
-  training = True
-  ops = defaultdict(dict)
-
-  def __init__(self, data, device=Device.DEFAULT, requires_grad=True):
-    self.device, self.data = device, self._move_data(data, device)
-
-    self.grad, self.requires_grad = None, requires_grad
-
-    # internal variables used for autograd graph construction
-    self._ctx = None
 
   def __repr__(self):
-    return f"<Tensor {self.data!r} with grad {(self.grad.data if self.grad else None)!r}>"
+    ld = self.uop
+    ld_repr = f"<UOp {ld.device} {ld.shape} {str(ld.dtype)[7:]}>"
+    return f"<Tensor {ld_repr} on {self.device} with grad {(self.grad.uop if self.grad is not None else None)!r}>"
 
-  def assign(self, x):
-    if not isinstance(x, Tensor):
-      x = Tensor(x)
-    assert self.shape == x.shape
-    self.data = x.data
+  # Python has a non moving GC, so this should be okay
+  def __hash__(self): return id(self)
+
+  def __bool__(self): raise TypeError("__bool__ on Tensor is not defined")
+
+  def __len__(self):
+    if not self.shape: raise TypeError("len() of a 0-d tensor")
+    return self.shape[0]
 
   @property
-  def shape(self):
-    return self.data.shape
+  def device(self) -> str|tuple[str, ...]|None: return self.uop.device
+
+  @property
+  def shape(self) -> tuple[sint, ...]: return self.uop.shape
+
+  @property
+  def dtype(self) -> DType: return self.uop.dtype
+
+  # ***** data handlers ****
+
+  def as_param(self, slot:int):
+    return Tensor(self.uop.param_like(slot))
+
+  def call(self, *lst:Tensor, fxn:Tensor|UOp, grad_fxn:Callable|None=None) -> Tensor:
+    return Tensor(fxn._uop.call_with_output(*[t.uop for t in (self,)+lst], grad_fxn=grad_fxn))
+
+  def custom_kernel(self, *lst:Tensor, fxn:Callable, grad_fxn:Callable|None=None) -> list[Tensor]:
+    """
+    Call into a custom kernel written in UOps. Returns the Tensors after the Kernel has been applied.
+
+    This API is alpha and may change.
+    """
+    return [Tensor(u) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
+
+  @rewrite_group(lambda *tensors,ret: f"Schedule {len(tensors)} -> {len(ret[0].src)}")
+  def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
+    """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
+    sink = UOp.sink(*[t.uop for t in (self,)+lst])
+    if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Tensor Graph")
+    # weakness ends where storage begins
+    if any(u.dtype in dtypes.weaks and u.device is not None for u in sink.src):
+      raise RuntimeError("cannot realize a weak dtype; cast to a concrete dtype first")
+    # The outputs and the ALLOCs beneath their wrappers get bound storage, so all aliases share storage and call dependencies.
+    bases = {x.base for x in sink.src}
+    for x in list(bases):
+      while x.op in {Ops.STAGE, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD}: x = x.src[0].base
+      if (b:=x.storage_base).op is Ops.ALLOC: bases.add(b)
+
+    # Rebuild in dependency order: replacement values already reference the other outputs' storage.
+    tensor_map:dict[UOp, UOp] = {}
+    for x in sink.toposort():
+      u = x.replace(src=tuple(tensor_map.get(s, s) for s in x.src))
+      if x.op is Ops.ALLOC and (x.arg.bind_on_realize or x in bases): u = UOp.new_buffer(x.device, x.max_numel(), x.dtype)
+      elif x in bases and u.needs_storage():
+        # unwrap the rebuilt output to the compute; a STAGE means a contiguous view was requested
+        src, contiguous = u, False
+        while src.op in {Ops.STAGE, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD}:
+          contiguous |= src.op is Ops.STAGE
+          src = src.src[0]
+        if src.is_virtual or src.on_disk() or 0 in src.shape or src.has_buffer_identity(after_ok=True): u = src
+        elif src.op is Ops.AFTER and (src.src[1].op is Ops.STORE or (not contiguous and src.storage_base.has_buffer_identity())): u = src
+        elif contiguous and (view := contiguous_mops_to_view(None, u, src)) is not None: u = view
+        else:  # allocate fresh storage and store the compute into it
+          buf = UOp.new_buffer(src.device, prod(src.max_shard_shape), src.dtype).reshape(src.max_shard_shape).shrink_to(src.shard_shape)
+          if isinstance(src.device, tuple) and src.axis is not None: buf = buf.unshard(src.axis)
+          u = buf.after(buf.store(src))
+      if u is not x: tensor_map[x] = u
+
+    sink = tensor_map.get(sink, sink)
+    # Realized outputs become the storage their AFTER sequenced a store into. Compose with tensor_map before updating
+    # Tensors so map values reference final storage.
+    storage = graph_rewrite(stores:=UOp.sink(*(u for u in sink.toposort() if is_store_after(u))), pm_drop_after, bottom_up=True, name="drop after")
+    becomes_map = {u:s.shrink_to(u.shape) for u,s in zip(stores.src, storage.src)}
+    assert not any(x in becomes_map for x in becomes_map.values())
+    tensor_map = dict(zip(tensor_map, UOp.sink(*tensor_map.values()).substitute(becomes_map, walk=True).src))
+    _apply_map_to_tensors(becomes_map | tensor_map, name="bufferize")
+
+    return create_linear_with_vars(sink)
+
+  def schedule_linear(self, *lst:Tensor) -> UOp:
+    """Creates the schedule needed to realize these Tensor(s)."""
+    linear, var_vals = self.linear_with_vars(*lst)
+    assert len(var_vals) == 0
+    return linear
+
+  @disable_gc()
+  def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:
+    """Triggers the computation needed to create these Tensor(s)."""
+    to_realize = [x for x in (self,)+lst if x.uop.base.needs_storage()]
+    if len(to_realize):
+      linear, var_vals = Tensor.linear_with_vars(*to_realize)
+      run_linear(linear, var_vals, update_stats=do_update_stats)
+    return self
+
+  def replace(self, x:Tensor) -> Tensor:
+    """
+    Replaces the data of this tensor with the data of another tensor. Only the shape of the tensors must match.
+    """
+    # used for replacing a Tensor with a new version of it (potentially with a different device and dtype)
+    assert self.shape == x.shape, f"replace shape mismatch {self.shape} != {x.shape}"
+    self.uop = x.uop
+    return self
+
+  def assign(self, x:Tensor|PyConst|list|tuple) -> Tensor:
+    if self.dtype in dtypes.weaks: raise RuntimeError("cannot assign into a weak tensor; it has no storage")
+    is_disk = self.uop.on_disk()
+    if not isinstance(x, Tensor): x = Tensor(x, device="CPU" if is_disk else self.device, dtype=self.dtype)
+    if self.uop is x.uop: return self  # a self assign is a NOOP
+    # broadcast x (shape only, dtype must match)
+    x = x._broadcast_to(self.shape)
+    if x.dtype in dtypes.weaks: x = x.cast(least_upper_dtype(self.dtype, x.dtype))
+    if x.dtype != self.dtype: raise RuntimeError(f"assign dtype mismatch {self.dtype} != {x.dtype}")
+    if isinstance(self.device, tuple) and x.uop.device is not None and self.uop.axis != x.uop.axis:
+      raise RuntimeError(f"multi axis mismatch {self.uop.axis} != {x.uop.axis}")
+
+    # TODO: this is a hack for writing to DISK. remove with working assign
+    if is_disk:
+      (b:=self._buffer()).copy_from(Buffer("PYTHON", b.nbytes, opaque=x._data()))
+      return self
+    assigned_to = self.uop.storage_base
+    views = [self.uop]
+    while views[-1].op in GroupOp.Movement|{Ops.BITCAST, Ops.DETACH}: views.append(views[-1].src[0])
+    # assigning to a pending value that views no other live tensor is initialization, not a write: the whole tensor is
+    # overwritten, so the pending value is dead. (a broadcast const like `const_like` is EXPAND(CONST) but views nothing)
+    if not assigned_to.has_buffer_identity() and not any(_tensor_holds(u) for u in views[1:]):
+      self.uop = (x.uop.src[0] if x.uop.op is Ops.STAGE else x.uop).clone()
+      return self
+    # STORE+AFTER: STORE is the write effect (void), AFTER wraps the view for correct shape/ranging
+    ib = next((u for u in reversed(views) if u.has_buffer_identity() and (u is self.uop or _tensor_holds(u))), views[-1])
+    if ib is not self.uop:
+      # a partial write needs storage to land in: a pending value gets explicit storage (a clone)
+      target = ib if ib.has_buffer_identity(after_ok=True) else ib.clone()
+      store = self.uop.substitute({ib: target}, walk=True).store(x.uop)
+      # view assign: the base reads "after the store into the view" (one AFTER level). replace the node under the
+      # views (e.g. RESHAPE(BUFFER)) so @function's substitution catches it
+      for t in [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.storage_base is assigned_to]:
+        t.uop = t.uop.substitute({ib: target.after(store)}, walk=True)
+    else:
+      # simple assign
+      self.uop = self.uop.after(self.uop.store(x.uop))
+    return self
+
+  def _buffer(self) -> Buffer:
+    from tinygrad.engine.realize import capturing
+    if capturing and not getenv("UNSAFE_ALLOW_JIT_BUFFER"):
+      from tinygrad.engine.jit import JitError
+      raise JitError("cannot access tensor data during JIT capture, the value will be baked in")
+    x = self.contiguous()
+    if self.uop.device is None or isinstance(self.device, tuple): x = x.clone("CPU")
+    return cast(Buffer, x.realize().uop.buffer).ensure_allocated()
+
+  def _data(self) -> memoryview: return self._buffer().as_memoryview()
+
+  def data(self) -> memoryview:
+    """
+    Returns the data of this tensor as a memoryview.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1, 2, 3, 4])
+    print(np.frombuffer(t.data(), dtype=np.int32))
+    ```
+    """
+    if self.dtype in dtypes.weaks: return self.cast(self.commit_dtype()).data()
+    if 0 in self.shape: return memoryview(bytearray(0)).cast(self.dtype.fmt)  # type: ignore[arg-type,return-value]
+    assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+    buf = self._buffer()
+    fmt = self.dtype.fmt
+    assert fmt is not None, f"no fmt dtype for {self.dtype}"
+    assert fmt != "e" or sys.version_info >= (3, 12)
+    return buf.as_memoryview().cast(fmt, self.shape)  # type: ignore[arg-type,return-value]
+
+  def numpy(self) -> 'numpy.ndarray':
+    """
+    Returns the value of this tensor as a `numpy.ndarray`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1, 2, 3, 4])
+    print(repr(t.numpy()))
+    ```
+    """
+    if self.dtype in dtypes.weaks: return self.cast(self.commit_dtype()).numpy()
+    assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+    import numpy as np
+    if self.dtype in { dtypes.bfloat16, *dtypes.fp8s }: return self.float().numpy()
+    if 0 in self.shape: return np.empty(self.shape, dtype=_to_np_dtype(self.dtype))
+    np_dtype = _to_np_dtype(self.dtype)
+    assert np_dtype is not None, f"no np dtype for {self.dtype}"
+    return np.frombuffer(self._data(), dtype=np_dtype).reshape(self.shape)
+
+  def clone(self, device:str|tuple[str, ...]|None=None) -> Tensor:
+    """
+    Creates a clone of this tensor allocating a separate buffer for the data.
+    If `device` is specified, the clone is placed on that device.
+    """
+    ret = Tensor(self.uop.clone(device=device))
+    if self.grad is not None: ret.grad = self.grad.clone(device=device)
+    return ret.is_param_(self.is_param)
+
+  def to(self, device:str|tuple[str, ...]|None, force:bool=False) -> Tensor:
+    """
+    Moves the tensor to the given device. `force=True` inserts a transfer even for device-less values.
+    """
+    if self.uop.device is None and not force: return self
+    if (device:=canonicalize_device(device)) == self.device: return self
+    if isinstance(device, str) and is_disk_device(device):
+      if isinstance(self.device, tuple): raise RuntimeError("gather to a single device before storing to DISK")
+      if self.grad is not None: raise RuntimeError("tensor and gradient need separate DISK destinations; use explicit STOREs")
+      dst = self.uop.empty_like(device=device)
+      ret = Tensor(dst.after(dst.store(self.uop.cast(dst.dtype))))
+    elif self.uop.on_creation_device(): ret = Tensor(self.uop.clone(device))
+    else: ret = Tensor(self.uop.copy_to_device(device))
+    if self.grad is not None: ret.grad = self.grad.to(device, force=force)
+    return ret.is_param_(self.is_param)
+
+  def to_(self, device:str|tuple[str, ...]|None) -> Tensor:
+    """
+    Moves the tensor to the given device in place.
+    """
+    real = self.to(device)
+    if self.grad is not None and real.grad is not None: self.grad.replace(real.grad)
+    return self.replace(real)
+
+  def shard(self, devices:tuple[str, ...], axis:int|None=None) -> Tensor:
+    """
+    Shards the tensor across the given devices. Optionally specify which axis to shard on.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.empty(2, 4)
+    print(t.shard((t.device, t.device), axis=1).uop)
+    ```
+    """
+    if self.uop.device is None: return self
+    if not isinstance(self.device, str): raise RuntimeError("can't shard a multi-device tensor")
+    if len(devices) == 1: return self.to(devices[0])
+    devices = cast(tuple[str, ...], canonicalize_device(devices))
+    # a shard of a load from a creation device (disk/npy/python) wants the copy to persist, so it inserts a clone
+    src = self.uop.clone(devices) if self.uop.on_creation_device() else self.uop
+    uop = src.shard(devices, None if axis is None else self._resolve_dim(axis))
+    return Tensor(uop).is_param_(self.is_param)
+
+  def shard_(self, devices:tuple[str, ...], axis:int|None=None) -> Tensor:
+    """
+    Shards the tensor across the given devices in place.
+    """
+    return self.replace(self.shard(devices, axis))
+
+  def shard_like(self, y:Tensor) -> Tensor:
+    """
+    Shards the tensor the same way as `y` (same devices and axis).
+    """
+    if y.device is None: return self
+    if isinstance(y.device, str): return self.to(y.device)
+    return self if isinstance(self.device, tuple) and (y.device, y.uop.axis) == (self.device, self.uop.axis) else self.shard(y.device, y.uop.axis)
+
+  # ***** creation entrypoint *****
 
   @staticmethod
-  def _get_data_dtype(data):
-    return data.getdtype() if getattr(data, 'getdtype', None) else data.dtype
+  def from_blob(ptr:int, shape:tuple[int, ...], **kwargs) -> Tensor:
+    """
+    Exposes the pointer as a Tensor without taking ownership of the original data.
+    The pointer must remain valid for the entire lifetime of the created Tensor.
 
-  @property
-  def dtype(self):
-    return Tensor._get_data_dtype(self.data)
+    You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    Additionally, all other keyword arguments are passed to the constructor of the tensor.
+    """
+    r = Tensor.empty(*shape, **kwargs)
+    assert isinstance(r.device, str)
+    cast(Buffer, r.realize().uop.buffer).allocate(external_ptr=ptr)
+    return r
 
-  # ***** creation helper functions *****
+  @staticmethod
+  def from_url(url:str, gunzip:bool=False, **kwargs) -> Tensor:
+    """
+    Creates a Tensor from a URL.
 
-  @classmethod
-  def zeros(cls, *shape, **kwargs):
-    return cls(np.zeros(shape, dtype=np.float32), **kwargs)
+    This is the preferred way to access Internet resources.
+    It currently returns a DISK Tensor, but in the future it may return an HTTP Tensor.
+    This also will soon become lazy (when possible) and not print progress without DEBUG.
 
-  @classmethod
-  def ones(cls, *shape, **kwargs):
-    return cls(np.ones(shape, dtype=np.float32), **kwargs)
+    The `gunzip` flag will gzip extract the resource and return an extracted Tensor.
+    """
+    return Tensor(fetch(url, gunzip=gunzip), **kwargs)
 
-  @classmethod
-  def randn(cls, *shape, **kwargs):
-    return cls(np.random.randn(*shape).astype(np.float32), **kwargs)
-  
-  @classmethod
-  def arange(cls, stop, start=0, **kwargs):
-    return cls(np.arange(start=start, stop=stop).astype(np.float32), **kwargs)
+  _seed: int = int(time.time())
+  _device_seeds: dict[str, Tensor] = {}
+  _device_rng_counters: dict[str, Tensor] = {}
+  @staticmethod
+  def manual_seed(seed=0) -> None:
+    """
+    Sets the seed for random operations.
 
-  @classmethod
-  def uniform(cls, *shape, **kwargs):
-    return cls((np.random.uniform(-1., 1., size=shape)/np.sqrt(np.prod(shape))).astype(np.float32), **kwargs)
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    print(Tensor.rand(5).numpy())
+    print(Tensor.rand(5).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)  # reset to the same seed
+    print(Tensor.rand(5).numpy())
+    print(Tensor.rand(5).numpy())
+    ```
+    """
+    Tensor._seed, Tensor._device_seeds, Tensor._device_rng_counters = seed, {}, {}
 
-  @classmethod
-  def eye(cls, dim, **kwargs):
-    return cls(np.eye(dim).astype(np.float32), **kwargs)
+  @staticmethod
+  def _next_counter(device:str, num:int) -> tuple[Tensor, Tensor]:
+    if device not in Tensor._device_seeds:
+      seed = [int.from_bytes(hashlib.sha256(len(Tensor._device_seeds).to_bytes(4, "big")).digest(), "big"), Tensor._seed]
+      Tensor._device_seeds[device] = Tensor(seed, device=device, dtype=dtypes.uint32)
+      Tensor._device_rng_counters[device] = Tensor([0], device=device, dtype=dtypes.uint64)
+    counter = Tensor._device_rng_counters[device]
+    counter.assign(counter + num)
+    return Tensor._device_seeds[device], (counter - num).bitcast(dtypes.uint32)
 
   # ***** toposort and backward pass *****
 
-  def deepwalk(self):
-    def _deepwalk(node, visited, nodes):
-      visited.add(node)
-      if node._ctx:
-        [_deepwalk(i, visited, nodes) for i in node._ctx.parents if i not in visited]
-        nodes.append(node)
-      return nodes
-    return _deepwalk(self, set(), [])
-
-  def backward(self):
-    assert self.shape == (1,)
-
-    # fill in the first grad with one
-    # this is "implicit gradient creation"
-    self.grad = Tensor(np.ones(self.shape, dtype=self.dtype), device=self.device, requires_grad=False)
-
-    for t0 in reversed(self.deepwalk()):
-      assert (t0.grad is not None)
-      with ProfileOp(t0._ctx.__class__.__name__, [t0.grad], backward=True) as po:
-        grads = t0._ctx.backward(t0._ctx, t0.grad.data)
-      if len(t0._ctx.parents) == 1:
-        grads = [grads]
-      for t, g in zip(t0._ctx.parents, grads):
-        if g is not None:
-          assert g.shape == t.shape, \
-            f"grad shape must match tensor shape in {self._ctx!r}, {g.shape!r} != {t.shape!r}"
-          gt = Tensor(g, device=self.device, requires_grad=False)
-          t.grad = gt if t.grad is None else (t.grad + gt)
-
-  # ***** tinygrad supports many devices *****
-
-  @staticmethod
-  def _move_data(data, device):
-    if isinstance(data, list):
-      data = np.array(data, dtype=np.float32)
-    if isinstance(data, np.ndarray):
-      data = data.view(Device.buffers[Device.CPU])
-    if isinstance(data, Device.buffers[device]):
-      return data
-
-    if Tensor._get_data_dtype(data) != np.float32 and not Tensor.did_float_warning:
-      # warning? float64 is actually needed for numerical jacobian
-      print(f"warning, {data.shape!r} isn't float32, it's {data.dtype}")
-      Tensor.did_float_warning = True
-
-    data = data.toCPU().view(Device.buffers[Device.CPU])
-    return Device.buffers[device].fromCPU(data)
-
-  def to_(self, device):
-    self.data, self.device = self._move_data(self.data, device), device
-    if self.grad: self.grad.to_(device)
-
-  def to(self, device):
-    ret = Tensor(self.data, device)
-    if self.grad: ret.grad = self.grad.to(device)
-    return ret
-
-  def detach(self):
-    return Tensor(self.data, device=self.device)
-
-  # ***** non first class ops *****
-  
-  def __getitem__(self, val):
-    arg = []
-    new_shape = []
-    if val is not None:
-      for i, s in enumerate(val if isinstance(val, (list, tuple)) else [val]):
-        if isinstance(s, int):
-          arg.append((s, s + 1))
-        else:
-          arg.append((s.start if s.start is not None else 0,
-            (s.stop if s.stop >=0 else self.shape[i]+s.stop) if s.stop is not None else self.shape[i]))
-          new_shape.append(arg[-1][1] - arg[-1][0])
-          assert s.step is None or s.step == 1
-    new_shape += self.shape[len(arg):]
-    return self.slice(arg = arg + [(0,self.shape[i]) for i in range(len(arg), len(self.shape))]).reshape(shape=new_shape)
-
-  def cat(self, y, dim=0):
-    assert len(self.shape) == len(y.shape)
-    dim = (dim + len(self.shape)) if dim < 0 else dim
-    s1, s2 = [], []
-    for i in range(len(self.shape)):
-      if i != dim:
-        assert self.shape[i] == y.shape[i]
-        s1.append((0, self.shape[i]))
-        s2.append((0, self.shape[i]))
-      else:
-        s1.append((0, self.shape[i]+y.shape[i]))
-        s2.append((-self.shape[i], y.shape[i]))
-    return self.slice(arg=s1) + y.slice(arg=s2)
-
-  def pad2d(self, padding):
-    return self[:, :, -padding[2]:self.shape[2]+padding[3], -padding[0]:self.shape[3]+padding[1]]
-
-  def matmul(self, w):
-    if len(self.shape) > 2 and len(w.shape) == 2:
-      return self.reshape(shape=(-1, self.shape[-1]))._matmul(w).reshape(shape=list(self.shape[0:-1]) + [-1])
-    else:
-      return self._matmul(w)
-  dot = matmul
-
-  def _canonicalize_reduce_axis(self, axis):
-    if axis is None: axis = range(len(self.shape))
-    if isinstance(axis, int): axis = [axis]
-    axis = tuple([x if x >= 0 else x+len(self.shape) for x in axis])
-    shape = [self.shape[i] for i in range(len(self.shape)) if i not in axis]
-    shape = [1] if shape == [] else shape
-    return axis, shape
-
-  def sum(self, axis=None, keepdim=False):
-    axis, out_shape = self._canonicalize_reduce_axis(axis)
-    ret = self._sum(axis=axis)
-    return ret if keepdim else ret.reshape(shape=out_shape)
-
-  def max(self, axis=None, keepdim=False):
-    axis, out_shape = self._canonicalize_reduce_axis(axis)
-    ret = self._max(axis=axis)
-    return ret if keepdim else ret.reshape(shape=out_shape)
-
-  def mean(self, axis=None, keepdim=False):
-    out = self.sum(axis=axis, keepdim=keepdim)
-    return out * (np.prod(out.shape)/np.prod(self.shape))
-
-  def sqrt(self):
-    return self.pow(0.5)
-
-  def div(self, y):
-    return self * (y ** -1.0)
-  __truediv__ = div
-
-  def sigmoid(self):
-    #e = self.exp(); return e.div(1 + e)
-    return (1.0 + (0.0-self).exp()) ** -1.0
-
-  def swish(self):
-    return self * self.sigmoid()
-
-  def relu6(self):
-    return self.relu() - (self-6).relu()
-
-  def hardswish(self):
-    return self * (self+3).relu6() * (1/6)
-
-  def tanh(self):
-    return 2.0 * ((2.0 * self).sigmoid()) - 1.0
-
-  def gelu(x):
-    # https://github.com/huggingface/transformers/blob/master/src/transformers/activations.py
-    #import torch; return Tensor(torch.nn.functional.gelu(torch.tensor(x.data)).numpy())
-    return 0.5 * x * (1 + (x * 0.7978845608 * (1 + 0.044715 * x * x)).tanh())
-
-  def leakyrelu(self, neg_slope=0.01):
-    return self.relu() - (-neg_slope*self).relu()
-
-  def softmax(self):
-    ns = list(self.shape)[:-1]+[1]
-    m = self.max(axis=len(self.shape)-1).reshape(shape=ns)
-    e = (self - m).exp()
-    ss = e.sum(axis=len(self.shape)-1).reshape(shape=ns)
-    return e.div(ss)
-
-  def logsoftmax(self):
-    ns = list(self.shape)[:-1]+[1]
-    m = self.max(axis=len(self.shape)-1).reshape(shape=ns)
-    ss = m + (self-m).exp().sum(axis=len(self.shape)-1).reshape(shape=ns).log()
-    return self - ss
-
-  def dropout(self, p=0.5):
-    if Tensor.training:
-      _mask = np.asarray(np.random.binomial(1, 1.0-p, size=self.shape), dtype=self.dtype)
-      return self * Tensor(_mask, requires_grad=False, device=self.device) * (1/(1.0 - p))
-    else:
-      return self
-
-  def softplus(self, limit=20, beta=1):
-    # safe softplus - 1/beta*log(1 + exp(beta*x)) (PyTorch)
-    eb = (self*beta).exp()
-    ret = (1 + eb).log()
-    return (1/beta)*ret
-
-  def mish(self):
-    return self * (self.softplus().tanh()) # x*tanh(softplus(x))
-
-  def abs(self):
-    return self.relu() + (-1.0*self).relu()
-
-  def sign(self):
-    return self / (self.abs() + 1e-10)
-
-  def _pool2d(self, py, px):
-    xup = self[:, :, :self.shape[2]-self.shape[2]%py, :self.shape[3]-self.shape[3]%px]
-    return xup.reshape(shape=(xup.shape[0], xup.shape[1], xup.shape[2]//py, py, xup.shape[3]//px, px))
-
-  def avg_pool2d(self, kernel_size=(2,2)):
-    return self._pool2d(*kernel_size).mean(axis=(3,5))
-
-  def max_pool2d(self, kernel_size=(2,2)):
-    return self._pool2d(*kernel_size).max(axis=(3,5))
-
-  def conv2d(self, weight, bias=None, stride=1, groups=1):
-    ret = self._conv2d(weight, stride=stride, groups=groups)
-    return ret if bias is None else ret.add(bias.reshape(shape=[1, -1, 1, 1]))
-
-  # ***** functional nn ops *****
-
-  def linear(self, weight, bias):
-    shp = [1] * (len(self.shape)-1) + [-1]
-    ret = self.mul(weight.reshape(shape=shp)) if len(weight.shape) == 1 else self.dot(weight)
-    return ret.add(bias.reshape(shape=shp))
-
-  def sequential(self, ll):
-    for l in ll: self = l(self)
+  def backward(self, gradient:Tensor|None=None) -> Tensor:
+    """
+    Propagates the gradient of a tensor backwards through the computation graph.
+    If the 'gradient' argument is not provided, the tensor must be a scalar, and the gradient is implicitly set to 1.0.
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1.0, 2.0, 3.0, 4.0])
+    t.sum().backward()
+    print(t.grad.numpy())
+    ```
+    """
+    all_uops = self.uop.toposort()
+    # backward fills .grad for every in-scope float tensor with a device
+    tensors_need_grad: list[Tensor] = [t for tref in all_tensors if (t:=tref()) is not None and \
+                                       t.uop in all_uops and t.is_floating_point() and t.device is not None]
+    # clear contexts
+    for t,g in zip(tensors_need_grad, self.gradient(*tensors_need_grad, gradient=gradient)):
+      assert g.shape == t.shape, f"grad shape must match tensor shape, {g.shape!r} != {t.shape!r}"
+      if g.device is None: g = g.clone(device=t.device)
+      if t.grad is None: t.grad = g
+      else: t.grad.assign(t.grad + g.to(t.grad.device))
     return self
 
-  def layernorm(x, eps=1e-5):
-    y = (x - x.mean(axis=-1, keepdim=True))
-    return y.div((y*y).mean(axis=-1, keepdim=True).add(eps).sqrt())
+  # ***** movement ops *****
 
-# An instantiation of the Function is the Context
-class Function:
-  def __new__(cls, *args, **kwargs):
-    cls.forward = staticmethod(cls.forward)
-    cls.backward = staticmethod(cls.backward)
-    return super().__new__(cls)
+  def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(UOp._mop, op=op, arg=arg)
+  def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(UOp._rop, op=op, axis=axis)
 
-  def __init__(self, *tensors):
-    self.parents = tensors
-    self.saved_tensors = []
+  def __setitem__(self, indices, v:Tensor|PyConst|list|tuple) -> None:
+    if self.dtype in dtypes.weaks: raise RuntimeError("cannot setitem into a weak tensor; it has no storage")
+    if isinstance(v, Tensor):
+      if v.dtype in dtypes.weaks: v = v.cast(least_upper_dtype(self.dtype, v.dtype))
+      if v.dtype != self.dtype: raise RuntimeError(f"setitem dtype mismatch: {self.dtype=} != {v.dtype=}")
+    # raise if mutation would diverge from eager (allow only pure views of a realized buffer; exclude +=/-= RHS via v_uop/v_bw)
+    v_uop, v_bw = (v.uop, v.uop.backward_slice) if isinstance(v, Tensor) else (None, {})
+    if self.uop.op_in_backward_slice_with_self(Ops.BUFFER, Ops.ALLOC):
+      shared = self.uop.base if self.uop.base.is_realized else None
+      if any(self.uop in t.uop.backward_slice_with_self and t.uop.base is not shared for tref in all_tensors
+             if (t:=tref()) is not None and t is not self and t.uop is not v_uop and t.uop not in v_bw):
+        raise RuntimeError("can't setitem on a tensor with other uses")
+    idx = [indices] if (isinstance(indices, list) and all_int(indices)) or not isinstance(indices, (tuple, list)) else list(indices)
+    is_disk = self.uop.on_disk()
+    advanced = any(isinstance(i, (Tensor, list, tuple)) for i in idx)
+    realized = is_disk or self.uop.base.op in {Ops.BUFFER, Ops.ALLOC} or self.uop.base.without_after.is_realized
+    if (not self.uop.base.is_realized and self.is_floating_point()) or not (advanced or realized):
+      if not isinstance(v, Tensor): v = Tensor(v, device=self.device, dtype=self.dtype)
+      self.replace(self._getitem(indices, v))
+    elif advanced: # advanced setitem
+      if is_disk: raise RuntimeError("advanced setitem is not supported for DISK tensors")
+      if not isinstance(v, Tensor): v = Tensor(v, device=self.device, dtype=self.dtype)
+      self.assign(self._getitem(indices, v))
+    else: # basic setitem
+      self[indices].assign(v)
 
-  def save_for_backward(self, *x):
-    self.saved_tensors.extend(x)
+  def __delitem__(self, indices) -> None:
+    raise TypeError("Tensor does not support deleting items")
 
-  def apply(self, *x, **kwargs):
-    ctx = self(*x) # self - operation i.e 'add', 'sub', etc.
-    # use default params
-    params = inspect.signature(self.forward).parameters
-    for p in params.values():
-      if p.default is not p.empty:
-        setattr(ctx, p.name, p.default)
-    # overwrite with passed params
-    for k, v in kwargs.items():
-      setattr(ctx, k, v)
-    with ProfileOp(ctx.__class__.__name__, x) as po:
-      po.output = ret = Tensor(self.forward(ctx, *[t.data for t in x], **kwargs),
-                   device=ctx.device, requires_grad=any([t.requires_grad for t in x]))
-    if ret.requires_grad:
-      ret._ctx = ctx
-    return ret
+  # ***** op wrappers *****
 
-def register(name, fxn, device=Device.CPU):
-  Tensor.ops[device][name] = fxn
-  def dispatch(*x, **kwargs):
-    tt = [arg for arg in x if isinstance(arg, Tensor)][0]
-    x = [Tensor(np.array([arg], dtype=tt.dtype), device=tt.device, requires_grad=False) if not isinstance(arg, Tensor) else arg for arg in x]
-    f = Tensor.ops[tt.device][name]
-    #f.cl_ctx, f.cl_queue, f.device = cl_ctx, cl_queue, tt.device
-    f.device = tt.device
-    return f.apply(f, *x, **kwargs)
-  if getattr(Tensor, name, None) is not None:
-    setattr(Tensor, "_"+name, dispatch)
-  else:
-    setattr(Tensor, name, dispatch)
-  if name in ['add', 'sub', 'mul', 'pow', 'matmul']:
-    setattr(Tensor, f"__{name}__", dispatch)
-    setattr(Tensor, f"__i{name}__", lambda self,x: self.assign(dispatch(self,x)))
-    setattr(Tensor, f"__r{name}__", lambda self,x: dispatch(x,self))
+  # unlike Tensors, UOps are immutable, so these don't go in mixin
+  def __iadd__(self, x) -> Tensor: return self.assign(self.add(x)) # type: ignore[misc]
+  def __isub__(self, x) -> Tensor: return self.assign(self.sub(x)) # type: ignore[misc]
+  def __imul__(self, x) -> Tensor: return self.assign(self.mul(x)) # type: ignore[misc]
+  def __itruediv__(self, x) -> Tensor: return self.assign(self.div(x)) # type: ignore[misc]
+  def __ifloordiv__(self, x) -> Tensor: return self.assign(self.__floordiv__(x)) # type: ignore[misc]
+  def __ipow__(self, x) -> Tensor: return self.assign(self.pow(x)) # type: ignore[misc]
+  def __iand__(self, x) -> Tensor: return self.assign(self.bitwise_and(x)) # type: ignore[misc]
+  def __ior__(self, x) -> Tensor: return self.assign(self.bitwise_or(x)) # type: ignore[misc]
+  def __ixor__(self, x) -> Tensor: return self.assign(self.bitwise_xor(x)) # type: ignore[misc]
+  def __ilshift__(self, x) -> Tensor: return self.assign(self.lshift(x)) # type: ignore[misc]
+  def __irshift__(self, x) -> Tensor: return self.assign(self.rshift(x)) # type: ignore[misc]
+  def __imatmul__(self, x) -> Tensor: return self.assign(self.matmul(x)) # type: ignore[misc]
 
-for device in [device for device in Device.__dict__.keys() if device[0] != "_"]:
-  setattr(Tensor, f"{device.lower()}", functools.partialmethod(Tensor.to, Device.__dict__[device]))
-  setattr(Tensor, f"{device.lower()}_", functools.partialmethod(Tensor.to_, Device.__dict__[device]))
+  def __eq__(self, x) -> Tensor: return self.eq(x)                      # type: ignore[override]
 
-# this registers all the operations
-def _register_ops(namespace, device=Device.CPU):
-  for name, cls in inspect.getmembers(namespace, inspect.isclass):
-    if name.endswith("Buffer"):  Device.buffers[device] = cls
-    elif name[0] != "_":  register(name.lower(), cls, device=device)
+  # ***** encoding/decoding ops *****
 
-import importlib
-for d,ops in Device.imports.items():
-  try:
-    _register_ops(importlib.import_module('tinygrad.ops.'+ops), d)
-  except ImportError:
-    pass
+  def decode_hevc_frame(self, frame_pos:Variable, shape:tuple[int,...], state:Tensor, ref_frames:list[Tensor]|None=None) -> Tensor:
+    """
+    Creates a Tensor by decoding an HEVC frame chunk.
+
+    You must provide the output shape of the decoded data (`shape`), the HEVC context (`vstate`), and, if required by the chunk,
+    the reference frames (`ref_frames`).
+    """
+    ref_frames = [x.contiguous() for x in ref_frames or []]
+    assert frame_pos.is_bound_var, "frame_pos must be a bound Variable"
+    srcs = (out:=Tensor.empty(*shape, device=self.device, dtype=self.dtype), self.contiguous(), state.contiguous(), *ref_frames)
+    fn = UOp.custom_function("encdec", frame_pos.unbound(), *[UOp.const(s) for s in shape])
+    return Tensor(out.uop.after(fn.call(*[s.uop for s in srcs], frame_pos)))
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+def _profile_wrapper(fn: Callable[P, T]) -> Callable[P, T]:
+  @functools.wraps(fn)
+  def _wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+    if not PROFILE: return fn(*args, **kwargs)
+    with cpu_profile(TracingKey(fn.__name__), "USER"):
+      return fn(*args, **kwargs)
+  return _wrapper
+
+for name, fn in inspect.getmembers(Tensor, inspect.isfunction):
+  if name in ["__class__", "__del__", "__init__", "__new__", "__repr__", "backward", "sequential", "gradient"]: continue
+  setattr(Tensor, name, _profile_wrapper(fn))
